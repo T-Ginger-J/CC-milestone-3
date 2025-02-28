@@ -1,85 +1,76 @@
-import os
+import apache_beam as beam
+from apache_beam.options.pipeline_options import PipelineOptions
 import cv2
 import numpy as np
 import torch
-import torchvision.transforms as transforms
+import base64
+import json
 from ultralytics import YOLO
+from google.cloud import pubsub_v1
 
-# Load YOLOv8 model
-yolo_model = YOLO("yolov8n.pt")  # Use a different model if needed
-
-# Load MiDaS depth estimation model
+# Load Models
+yolo_model = YOLO("yolov8n.pt")
 midas = torch.hub.load("intel-isl/MiDaS", "MiDaS_small")
 midas.eval()
 
-# Preprocessing for MiDaS
-transform = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Resize((384, 384)),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-])
-
 def detect_pedestrians(image):
-    results = yolo_model(image)  # Run YOLO on the image
+    results = yolo_model(image)
     pedestrians = []
-    
     for result in results:
         for box in result.boxes:
-            class_id = int(box.cls.item())
-            confidence = float(box.conf.item())
-            bbox = box.xyxy[0].cpu().numpy().astype(int)  # Bounding box [x1, y1, x2, y2]
-            
-            if class_id == 0:  # COCO class 0 for 'person'
-                pedestrians.append((bbox, confidence))
-    
+            if int(box.cls.item()) == 0:  # COCO class 0 = 'person'
+                bbox = box.xyxy[0].cpu().numpy().astype(int)
+                pedestrians.append(bbox)
     return pedestrians
 
 def estimate_depth(image):
+    transform = torch.nn.Sequential(
+        torch.nn.Resize((384, 384)),
+        torch.nn.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    )
     image_resized = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    image_tensor = transform(image_resized).unsqueeze(0)
-    
+    image_tensor = torch.tensor(image_resized).permute(2, 0, 1).unsqueeze(0) / 255.0
     with torch.no_grad():
-        depth_map = midas(image_tensor)
-    
-    depth_map = depth_map.squeeze().cpu().numpy()
-    depth_map = cv2.resize(depth_map, (image.shape[1], image.shape[0]))  # Resize to original size
-    
+        depth_map = midas(transform(image_tensor)).squeeze().cpu().numpy()
     return depth_map
 
-def get_pedestrian_depth(image, pedestrians):
-    depth_map = estimate_depth(image)
-    depth_results = []
-    
-    for bbox, confidence in pedestrians:
-        x1, y1, x2, y2 = bbox
-        pedestrian_depth = depth_map[y1:y2, x1:x2]
-        avg_depth = np.mean(pedestrian_depth)  # Compute average depth
-        depth_results.append((bbox, confidence, avg_depth))
-    
-    return depth_results
+class ProcessImage(beam.DoFn):
+    def process(self, element):
+        message = json.loads(element.decode("utf-8"))
+        image_data = base64.b64decode(message["image"])
+        image = cv2.imdecode(np.frombuffer(image_data, np.uint8), cv2.IMREAD_COLOR)
+        
+        pedestrians = detect_pedestrians(image)
+        depth_map = estimate_depth(image)
+        
+        results = []
+        for bbox in pedestrians:
+            x1, y1, x2, y2 = bbox
+            avg_depth = np.mean(depth_map[y1:y2, x1:x2])
+            results.append({"bbox": bbox.tolist(), "depth": avg_depth})
+        
+        yield json.dumps(results)
 
-def process_images(folder_path):
-    for filename in os.listdir(folder_path):
-        if filename.startswith(('A', 'C')) and filename.endswith(('.jpg', '.png')):
-            image_path = os.path.join(folder_path, filename)
-            image = cv2.imread(image_path)
-            
-            if image is None:
-                print(f"Could not read image: {filename}")
-                continue
-            
-            pedestrians = detect_pedestrians(image)
-            depth_results = get_pedestrian_depth(image, pedestrians)
-            
-            for bbox, confidence, avg_depth in depth_results:
-                x1, y1, x2, y2 = bbox
-                cv2.rectangle(image, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.putText(image, f"Depth: {avg_depth:.2f}m", (x1, y1 - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-            
-            cv2.imshow("Detection", image)
-            cv2.waitKey(0)
-            cv2.destroyAllWindows()
+def run_pipeline(input_topic, output_topic, project_id):
+    options = PipelineOptions(
+        streaming=True,
+        project=project_id,
+        runner="DataflowRunner",
+        region="us-central1"
+    )
+    
+    with beam.Pipeline(options=options) as pipeline:
+        (
+            pipeline
+            | "Read from Pub/Sub" >> beam.io.ReadFromPubSub(topic=input_topic)
+            | "Process Image" >> beam.ParDo(ProcessImage())
+            | "Write to Pub/Sub" >> beam.io.WriteToPubSub(topic=output_topic)
+        )
 
-# Run the script
-process_images("Dataset_Occluded_Pedestrian")
+# Run locally for testing
+if __name__ == "__main__":
+    run_pipeline(
+        "projects/YOUR_PROJECT_ID/topics/input-topic",
+        "projects/YOUR_PROJECT_ID/topics/output-topic",
+        "YOUR_PROJECT_ID"
+    )
